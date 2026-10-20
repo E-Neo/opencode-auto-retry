@@ -1,0 +1,15 @@
+{
+  "name": "opencode-auto-retry",
+  "version": "0.1.0",
+  "description": "Auto-retry plugin for OpenCode: tunes retries within the built-in limit and resumes turns past it via synthetic messages.",
+  "type": "module",
+  "exports": {
+    ".": "./index.ts"
+  },
+  "dependencies": {
+    "@opencode/plugin": "^2.1.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.0"
+  }
+}
