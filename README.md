@@ -1,105 +1,69 @@
 # opencode-auto-retry
 
-Auto-retry plugin for OpenCode (V2). Works around OpenCode's hard built-in
-retry limit (`Schedule.recurs(10)` → 11 physical attempts per turn) that
-otherwise surfaces as an `AIError` and kills the turn.
+Auto-retry plugin for OpenCode (V2). Keeps a turn alive through transient
+provider failures (rate limits, 5xx, transport errors) instead of letting the
+error surface after OpenCode's built-in retry budget is spent.
 
-## How it works
+## Mechanism — three levels
 
-- **Within the limit** — the `retry` hook tunes OpenCode's own retries:
-  transient errors get a configurable exponential backoff, terminal errors
-  (`provider.auth`, `provider.quota`, `provider.invalid-request`, …) fail fast,
-  and at the last attempt the turn is handed off to the replay layer.
-- **Past the limit** — on a terminal transient failure
-  (`session.step.failed` / `session.execution.failed`) the session is resumed
-  with `session.synthetic({ ..., resume: true })`. This starts a new turn with a
-  fresh attempt counter. The original user message is never re-sent, so the
-  transcript has **no duplicate prompt** — only the synthetic announcement.
-
-## Safety
-
-- `maxReplays` per turn and a `timeBudgetMs` wall-clock budget (whichever runs
-  out first stops the loop).
-- Per-provider circuit breaker (`failureThreshold`, `cooldownMs`) so a dead
-  provider is not hammered.
-- Replays are cancelled when the user interrupts or sends a new prompt.
-
-## Install / load
-
-Place the plugin under the global plugins directory; OpenCode discovers it
-automatically:
+| Level | Name | What happens |
+|---|---|---|
+| L1 | **backoff** | OpenCode retries the model request; the plugin tunes the wait between attempts (never shorter than the provider's `Retry-After`). |
+| L2 | **resume** | When the turn finally fails, the plugin posts a "continue" message that starts a fresh turn. It keeps resuming for `resume.withinMs`. |
+| L3 | **pause** | When the resume window is over, it waits `pause.forMs` (a fixed sleep, not a backoff), then starts a new resume window. It stops after `pause.untilMs` since the first failure. |
 
 ```
-~/.config/opencode/plugins/auto-retry/
+L1  backoff    ── wait between attempts (exponential)
+L2  resume     ── repeat L1 for 30 min
+L3  pause      ── sleep 30 min, repeat L2, stop after 8 h
 ```
 
-If you register it in the `plugins` array of `opencode.jsonc` instead (to pass
-options inline), **do not** leave it in the auto-discovered `plugins/`
-directory too — OpenCode dies with "Duplicate plugin ID" when the same plugin
-loads twice.
+## Behavior
 
-## Configuration
+- Only **transient** failures are retried: rate limits (429), 408/409/5xx,
+  transport failures, incomplete streams, and unknown failures. Terminal errors
+  (`provider.auth`, `provider.quota` without 429, invalid request, content
+  filter, permission) fail fast.
+- A `429` is always treated as transient, even when OpenCode maps it to
+  `provider.quota` (common for tpm/rpm limits).
+- The failed turn's original user message is **never re-sent**. Resume posts one
+  synthetic message; the transcript has no duplicate prompt.
+- No persisted state. Counters/timers live in memory; an OpenCode restart starts
+  every session from zero.
 
-Options are read in this order (highest precedence first):
+## Defaults
 
-1. `ctx.options` — the `plugins` array entry in `opencode.jsonc`
-2. `$AUTO_RETRY_CONFIG` file, or `~/.config/opencode/auto-retry.json`
-3. built-in defaults
+Configured in code (`DEFAULTS` in `index.ts`) — there is **no config file**.
 
-Example `~/.config/opencode/auto-retry.json`:
-
-```json
-{
-  "enabled": true,
-  "providers": [],
-  "openCodeMaxAttempts": 11,
-  "withinLimit": {
-    "enabled": true,
-    "baseDelayMs": 2000,
-    "maxDelayMs": 30000,
-    "factor": 2,
-    "jitter": 0.2,
-    "handoffAtMaxAttempts": true
-  },
-  "replay": {
-    "enabled": true,
-    "maxReplays": 3,
-    "timeBudgetMs": 600000,
-    "announce": true,
-    "backoff": { "baseDelayMs": 15000, "maxDelayMs": 120000, "factor": 2, "jitter": 0.2 }
-  },
-  "circuitBreaker": {
-    "enabled": true,
-    "failureThreshold": 5,
-    "cooldownMs": 120000
-  },
-  "errorPatterns": {
-    "retryTypes": ["provider.timeout"],
-    "ignoreTypes": [],
-    "retryPatterns": [],
-    "ignorePatterns": []
-  }
-}
+```ts
+openCodeMaxAttempts: 11,                                  // OpenCode's real limit
+backoff: { startMs: 2000, maxMs: 30000, factor: 2, jitter: 0.2, handoffAtMaxAttempts: true },
+resume:  { withinMs: 1_800_000 },                         // 30 min
+pause:   { forMs: 1_800_000, untilMs: 28_800_000 },       // 30 min, 8 h total
 ```
 
-Set `providers` (e.g. `["sensenova"]`) to limit the plugin to specific
-providers. `errorPatterns` lets you force retry/ignore decisions per type or by
-message/body substring.
+## Install
 
-## Development
+Place the plugin under the global plugins directory (auto-discovered):
 
 ```sh
-cd ~/.config/opencode/plugins/auto-retry
-npm install
-npx tsc --noEmit
+git clone <repo-url> ~/.config/opencode/plugins/auto-retry
 ```
 
-Restart the service to pick up changes:
+OpenCode provides `@opencode/plugin` at runtime, so no `npm install` is needed;
+`node_modules` is only for local type-checking (`npm install && npx tsc --noEmit`).
+
+Verify it loaded:
 
 ```sh
-touch ~/.config/opencode/plugins/auto-retry/index.ts
-opencode service restart
+opencode plugin list | grep auto-retry
 ```
 
-Check it loaded: `opencode plugin list` and `~/.local/share/opencode/log/opencode.log`
-(role=server).
+## Layout
+
+```
+index.ts     plugin setup, L1 retry hook, L2/L3 loop, event subscription
+classify.ts  transient vs terminal failure classification
+backoff.ts   L1 exponential backoff + Retry-After floor
+state.ts     in-memory per-session state + the phase decision
+```

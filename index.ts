@@ -1,174 +1,62 @@
 /**
  * opencode-auto-retry
  *
- * Works around OpenCode's hard built-in retry limit (10 retries + initial =
- * 11 attempts, per `Schedule.recurs(10)` in packages/core/src/model-retry.ts).
+ * Three mechanisms, one per level:
  *
- * Two layers:
+ *   backoff — wait between request attempts (OpenCode retries; the plugin
+ *             only tunes the delays and never shortens `Retry-After`).
+ *   resume  — when a turn finally fails, post a "continue" message that starts
+ *             a fresh turn. Repeat for `resume.withinMs`.
+ *   pause   — when the resume window is over, wait `pause.forMs`, then start a
+ *             new window. Stop after `pause.untilMs` since the first failure.
  *
- *  A. WITHIN the limit — the `retry` hook tunes OpenCode's own retry decisions:
- *     transient errors get a configurable backoff, terminal errors fail fast,
- *     and at the last attempt the turn is handed off to layer B.
+ * All state is in memory: a restart starts every session from zero. The plugin
+ * writes no config, no storage, and no OpenCode state — apart from the synthetic
+ * "continue" message, which is the only way to resume a failed turn.
  *
- *  B. PAST the limit — when a transient failure surfaces anyway
- *     (`session.step.failed` / `session.execution.failed`), the session is
- *     resumed with `session.synthetic({ ..., resume: true })`. This starts a new
- *     turn with a fresh attempt counter, and the transcript's original user
- *     message is never re-sent (no duplication).
- *
- * Safety: max replays per turn, a wall-clock time budget, a per-provider circuit
- * breaker, and cancellation when the user interrupts or sends a new prompt.
- *
- * Options precedence (highest first):
- *   1. `ctx.options` (plugins array in opencode.jsonc)
- *   2. `$AUTO_RETRY_CONFIG` file, else `~/.config/opencode/auto-retry.json`
- *   3. built-in defaults
+ * Behavior is configured by editing DEFAULTS below; there is no config file.
  */
 
 import { Plugin } from "@opencode/plugin"
-import os from "node:os"
-import path from "node:path"
-import fs from "node:fs"
-import { shouldRetry, type ClassifierOptions, type ProviderError } from "./classify.js"
-import { backoffDelay, resolveRetryDelay, type BackoffConfig } from "./backoff.js"
-import { ReplayState } from "./state.js"
+import { shouldRetry, type ProviderError } from "./classify.js"
+import { resolveRetryDelay } from "./backoff.js"
+import { decidePhase, RetryStates } from "./state.js"
 
-interface WithinLimitOptions extends BackoffConfig {
-  readonly enabled: boolean
-  readonly handoffAtMaxAttempts: boolean
-}
-
-interface ReplayOptions {
-  readonly enabled: boolean
-  readonly maxReplays: number
-  readonly timeBudgetMs: number
-  readonly announce: boolean
-  readonly backoff: BackoffConfig
-}
-
-interface CircuitBreakerOptions {
-  readonly enabled: boolean
-  readonly failureThreshold: number
-  readonly cooldownMs: number
-}
-
-interface Options {
-  readonly enabled: boolean
-  /** Provider allow-list; empty means all providers. */
-  readonly providers: string[]
-  /** Mirror of OpenCode's hard attempt limit (recurs(10) + initial = 11). */
-  readonly openCodeMaxAttempts: number
-  readonly withinLimit: WithinLimitOptions
-  readonly replay: ReplayOptions
-  readonly circuitBreaker: CircuitBreakerOptions
-  readonly errorPatterns: ClassifierOptions
-}
-
-const DEFAULT_OPTIONS: Options = {
-  enabled: true,
-  providers: [],
+const DEFAULTS = {
+  /** OpenCode's real per-turn attempt limit (recurs(10) + initial = 11). */
   openCodeMaxAttempts: 11,
-  withinLimit: {
-    enabled: true,
-    baseDelayMs: 2_000,
-    maxDelayMs: 30_000,
+
+  /** L1 — wait between request attempts. */
+  backoff: {
+    startMs: 2_000,
+    maxMs: 30_000,
     factor: 2,
     jitter: 0.2,
     handoffAtMaxAttempts: true,
   },
-  replay: {
-    enabled: true,
-    maxReplays: 3,
-    timeBudgetMs: 600_000,
-    announce: true,
-    backoff: { baseDelayMs: 15_000, maxDelayMs: 120_000, factor: 2, jitter: 0.2 },
+
+  /** L2 — keep resuming the failed turn. */
+  resume: {
+    withinMs: 1_800_000, // 30 minutes
   },
-  circuitBreaker: {
-    enabled: true,
-    failureThreshold: 5,
-    cooldownMs: 120_000,
+
+  /** L3 — pause, then resume again. */
+  pause: {
+    forMs: 1_800_000, // 30 minutes
+    untilMs: 28_800_000, // 8 hours since the first failure
   },
-  errorPatterns: {},
-}
+} as const
 
-// ---------------------------------------------------------------------------
-// Options loading
-// ---------------------------------------------------------------------------
-
-function merge<T>(target: T, source: unknown): T {
-  if (source === null || source === undefined || typeof source !== "object") return target
-  for (const [key, value] of Object.entries(source)) {
-    if (value === undefined) continue
-    const current = (target as Record<string, unknown>)[key]
-    if (current && typeof current === "object" && !Array.isArray(current) && value && typeof value === "object") {
-      merge(current, value)
-    } else {
-      ;(target as Record<string, unknown>)[key] = value
-    }
-  }
-  return target
-}
-
-function readConfigFile(file: string): Record<string, unknown> | undefined {
-  try {
-    const text = fs.readFileSync(file, "utf8")
-    const parsed: unknown = JSON.parse(text)
-    return parsed && typeof parsed === "object" ? (parsed as Record<string, unknown>) : undefined
-  } catch {
-    return undefined
-  }
-}
-
-function loadOptions(pluginOptions: unknown): Options {
-  const configDir = process.env.XDG_CONFIG_HOME
-    ? path.join(process.env.XDG_CONFIG_HOME, "opencode")
-    : path.join(os.homedir(), ".config", "opencode")
-  const configFile = process.env.AUTO_RETRY_CONFIG ?? path.join(configDir, "auto-retry.json")
-
-  const options = structuredClone(DEFAULT_OPTIONS)
-  merge(options, readConfigFile(configFile))
-  merge(options, pluginOptions)
-  return options
-}
-
-// ---------------------------------------------------------------------------
-// Plugin
-// ---------------------------------------------------------------------------
+const log = (message: string) => console.error(`[auto-retry] ${message}`)
 
 export default Plugin.define({
   id: "auto-retry",
   async setup(ctx) {
-    const options = loadOptions(ctx.options)
-    console.error(`[auto-retry] loaded (config file: ${process.env.AUTO_RETRY_CONFIG ?? "~/.config/opencode/auto-retry.json"})`)
-    console.error(`[auto-retry] options: ${JSON.stringify(options)}`)
-    if (!options.enabled) return
+    const states = new RetryStates()
 
-    const state = new ReplayState()
-    // sessionID -> providerID, learned from retry-hook events so the event
-    // stream can scope decisions without an extra lookup.
-    const sessionProviders = new Map<string, string>()
-
-    const isScopedProvider = (providerID: string | undefined) =>
-      options.providers.length === 0 || (providerID !== undefined && options.providers.includes(providerID))
-
-    const resolveProvider = async (sessionID: string): Promise<string | undefined> => {
-      const cached = sessionProviders.get(sessionID)
-      if (cached) return cached
-      try {
-        const session = await ctx.session.get({ sessionID })
-        const providerID = session?.model?.providerID
-        if (providerID) sessionProviders.set(sessionID, providerID)
-        return providerID
-      } catch {
-        return undefined
-      }
-    }
-
-    const classifierOptions: ClassifierOptions = options.errorPatterns
-
-    // -----------------------------------------------------------------------
-    // Layer A: tune OpenCode's retries within the built-in limit
-    // -----------------------------------------------------------------------
+    // -------------------------------------------------------------------------
+    // L1 — backoff: tune OpenCode's per-attempt retry delay.
+    // -------------------------------------------------------------------------
 
     const retryHook = (event: {
       readonly sessionID: string
@@ -177,188 +65,149 @@ export default Plugin.define({
       readonly attempt: number
       decision: { retry: boolean; delay?: number }
     }) => {
-      sessionProviders.set(event.sessionID, event.model.providerID)
-      if (!isScopedProvider(event.model.providerID)) return
-      if (!options.withinLimit.enabled) return
-
-      if (!shouldRetry(event.error, classifierOptions)) {
+      if (!shouldRetry(event.error)) {
         event.decision = { retry: false }
-        console.error(
-          `[auto-retry] vetoing retry (attempt ${event.attempt}): ${event.error.type} ${event.error.status ?? ""}`.trim(),
-        )
+        log(`backoff: not retryable (${event.error.type} ${event.error.status ?? ""})`.trim())
         return
       }
-      const maxAttempts = Math.max(1, options.openCodeMaxAttempts)
-      if (
-        options.replay.enabled &&
-        options.withinLimit.handoffAtMaxAttempts &&
-        event.attempt >= maxAttempts
-      ) {
-        // Last chance: hand the turn over to the replay layer deterministically
-        // instead of running (and likely failing) the final OpenCode attempt.
+      if (event.attempt >= DEFAULTS.openCodeMaxAttempts && DEFAULTS.backoff.handoffAtMaxAttempts) {
+        // Hand the turn over to resume instead of running the final attempt.
         event.decision = { retry: false }
-        console.error(`[auto-retry] handing off at attempt ${event.attempt} to replay layer`)
+        log(`backoff: handing off at attempt ${event.attempt}`)
         return
       }
-      const delay = resolveRetryDelay(event.attempt, event.decision, options.withinLimit)
+      const delay = resolveRetryDelay(event.attempt, event.decision, DEFAULTS.backoff)
       event.decision = { retry: true, delay }
-      console.error(`[auto-retry] retry ${event.attempt}: ${event.error.type}, delay ${delay}ms`)
+      log(`backoff: attempt ${event.attempt} in ${delay}ms (${event.error.type})`)
     }
 
-    if (options.providers.length > 0) {
-      for (const providerID of options.providers) {
-        await ctx.session.hook("retry", retryHook, { providerID })
-      }
-    } else {
-      await ctx.session.hook("retry", retryHook)
-    }
+    await ctx.session.hook("retry", retryHook)
 
-    // -----------------------------------------------------------------------
-    // Reset per-turn replay state on every real user prompt (synthetic and
-    // shell messages do not run the prompt hook, so our own resumes never
-    // clobber this).
-    // -----------------------------------------------------------------------
-
+    // A real user prompt starts a clean slate (synthetic and shell messages do
+    // not run the prompt hook, so our own resumes never reset the state).
     await ctx.session.hook("prompt", (event: { readonly sessionID: string }) => {
-      state.reset(event.sessionID)
+      states.reset(event.sessionID)
     })
 
-    // -----------------------------------------------------------------------
-    // Layer B: resume past the limit via synthetic messages
-    // -----------------------------------------------------------------------
+    // -------------------------------------------------------------------------
+    // L2 — resume: post a "continue" message to start a fresh turn.
+    // -------------------------------------------------------------------------
 
-    const fireReplay = async (sessionID: string, error: ProviderError): Promise<void> => {
-      const log = (msg: string) => console.error(`[auto-retry] ${new Date().toISOString()} ${msg}`)
-      const session = state.get(sessionID)
-      if (session.interrupted) return log(`fireReplay bail: interrupted ${sessionID}`)
-      if (session.userPromptAt !== undefined && session.firstFailureAt !== undefined && session.userPromptAt > session.firstFailureAt) {
-        return log(`fireReplay bail: user took over ${sessionID}`)
-      }
-      const now = Date.now()
-      if (session.firstFailureAt !== undefined && now - session.firstFailureAt >= options.replay.timeBudgetMs) return log(`fireReplay bail: budget ${sessionID}`)
-      const providerID = await resolveProvider(sessionID)
-      if (!isScopedProvider(providerID)) return log(`fireReplay bail: unscoped ${sessionID} provider=${providerID}`)
-      if (options.circuitBreaker.enabled && providerID && state.isOpen(providerID, options.circuitBreaker.cooldownMs)) return log(`fireReplay bail: circuit open ${sessionID}`)
-
-      // Give the failed turn time to settle before waking the session. Bound the
-      // wait so we never block behind a brand-new user turn.
+    const resumeTurn = async (sessionID: string, error: ProviderError): Promise<void> => {
+      const state = states.get(sessionID)
+      if (state.interrupted || state.resuming) return
+      state.resuming = true
       try {
-        await Promise.race([
-          ctx.session.wait({ sessionID }),
-          new Promise((resolve) => setTimeout(resolve, 10_000)),
-        ])
-        log(`fireReplay wait resolved ${sessionID}`)
-      } catch (waitError) {
-        return log(`fireReplay bail: wait threw ${sessionID}: ${String(waitError)}`)
+        // Wait for the failed turn to settle before waking the session.
+        await ctx.session.wait({ sessionID })
+        // A new user prompt replaces the state; do not interleave with it.
+        if (states.get(sessionID) !== state) return
+
+        const status = error.status !== undefined ? ` (HTTP ${error.status})` : ""
+        await ctx.session.synthetic({
+          sessionID,
+          text: `⟳ Resuming the turn after provider error: ${error.type}${status}. Ignore the transient error above and continue with your previous request.`,
+          description: "auto-retry resume",
+          metadata: { source: "auto-retry", phase: "resume", error: error.type, status: error.status ?? null },
+          resume: true,
+        })
+        log(`resume: session ${sessionID} after ${error.type}${status}`)
+      } catch (cause) {
+        log(`resume: failed for ${sessionID}: ${String(cause)}`)
+      } finally {
+        state.resuming = false
       }
+    }
 
-      // The user may have sent a new prompt (which resets the session state)
-      // while we waited. If the entry we captured is no longer the current one,
-      // bail out: resuming now would interleave with the user's new turn.
-      if (state.get(sessionID) !== session) return log(`fireReplay bail: state changed ${sessionID}`)
+    // -------------------------------------------------------------------------
+    // L3 — pause: sleep, then start a new resume window.
+    // -------------------------------------------------------------------------
 
-      session.replays += 1
-      const statusText = error.status !== undefined ? ` (HTTP ${error.status})` : ""
-      const countText = options.replay.maxReplays > 1 ? ` (retry ${session.replays}/${options.replay.maxReplays})` : ""
-      const text = options.replay.announce
-        ? `⟳ Auto-retrying after provider error: ${error.type}${statusText}${countText}. Please ignore the transient error above and continue with your previous request.`
-        : `Please ignore the transient provider error above and continue with your previous request.`
-
+    const announcePause = async (sessionID: string): Promise<void> => {
       try {
         await ctx.session.synthetic({
           sessionID,
-          text,
-          description: "auto-retry",
-          metadata: { source: "auto-retry", attempt: session.replays, error: error.type, status: error.status ?? null },
-          resume: true,
+          text: `⏸ Still failing — pausing ${Math.round(DEFAULTS.pause.forMs / 60_000)} min before resuming again.`,
+          description: "auto-retry pause",
+          metadata: { source: "auto-retry", phase: "pause", pauseMs: DEFAULTS.pause.forMs },
+          resume: false,
         })
-        console.error(
-          `[auto-retry] ${new Date().toISOString()} resumed session ${sessionID} (retry ${session.replays}) after ${error.type} ${error.status ?? ""}`.trim(),
-        )
-      } catch (syntheticError) {
-        log(`fireReplay synthetic threw ${sessionID}: ${String(syntheticError)}`)
-        // Could not submit the resume (session busy or removed); count it as a
-        // replay failure so the circuit breaker can eventually give up.
-        if (providerID && options.circuitBreaker.enabled) {
-          state.recordFailure(providerID, options.circuitBreaker.failureThreshold)
-        }
+      } catch {
+        // The session may be gone; the pause still applies.
       }
     }
 
-    const scheduleReplay = async (sessionID: string, error: ProviderError): Promise<void> => {
-      const session = state.get(sessionID)
-      if (session.timer) return // already scheduled for this failure
-      if (session.interrupted) return
-
-      const providerID = await resolveProvider(sessionID)
-      if (!isScopedProvider(providerID)) return
-      if (options.circuitBreaker.enabled && providerID && state.isOpen(providerID, options.circuitBreaker.cooldownMs)) return
-
-      // The prompt hook may have reset the session while we awaited the lookup.
-      if (state.get(sessionID) !== session) return
+    const onTurnFailed = (sessionID: string, error: ProviderError): void => {
+      const state = states.get(sessionID)
+      if (state.timer || state.resuming || state.interrupted) return
 
       const now = Date.now()
-      if (session.firstFailureAt === undefined) session.firstFailureAt = now
-      if (session.replays >= options.replay.maxReplays) return
-      const budgetLeft = session.firstFailureAt + options.replay.timeBudgetMs - now
-      if (budgetLeft <= 0) return
+      state.firstFailureAt ??= now
+      state.resumeStartedAt ??= now
 
-      // A replay cycle is a whole resumed turn (fresh OpenCode retry schedule),
-      // so count every failure we observe after at least one replay against the
-      // provider's circuit breaker.
-      if (session.replays > 0 && providerID && options.circuitBreaker.enabled) {
-        state.recordFailure(providerID, options.circuitBreaker.failureThreshold)
-        if (state.isOpen(providerID, options.circuitBreaker.cooldownMs)) return
+      const phase = decidePhase({
+        now,
+        firstFailureAt: state.firstFailureAt,
+        resumeStartedAt: state.resumeStartedAt,
+        resumeWithinMs: DEFAULTS.resume.withinMs,
+        pauseUntilMs: DEFAULTS.pause.untilMs,
+      })
+
+      if (phase === "stop") {
+        log(`stop: patience window elapsed for ${sessionID}`)
+        return
       }
 
-      const nextAttempt = session.replays + 1
-      const delay = Math.min(backoffDelay(nextAttempt, options.replay.backoff), budgetLeft)
-      session.timer = setTimeout(() => {
-        session.timer = undefined
-        void fireReplay(sessionID, error).catch(() => {})
-      }, delay)
-      console.error(
-        `[auto-retry] scheduling resume for session ${sessionID} in ${delay}ms (replay ${nextAttempt}/${options.replay.maxReplays}, budget ${Math.max(0, budgetLeft)}ms left)`,
-      )
+      if (phase === "resume") {
+        // Resume immediately; the retry loop backoff happens inside the turn.
+        state.timer = setTimeout(() => {
+          state.timer = undefined
+          void resumeTurn(sessionID, error)
+        }, 0)
+        return
+      }
+
+      // phase === "pause"
+      log(`pause: ${DEFAULTS.pause.forMs}ms for ${sessionID}`)
+      void announcePause(sessionID)
+      state.timer = setTimeout(() => {
+        state.timer = undefined
+        state.resumeStartedAt = Date.now()
+        void resumeTurn(sessionID, error)
+      }, DEFAULTS.pause.forMs)
     }
 
-    const handleEvent = (event: unknown): void => {
-      const record = event as {
-        type?: string
-        data?: { sessionID?: string; error?: ProviderError }
-      }
-      if (!record?.type || !record.data?.sessionID) return
-      switch (record.type) {
-        case "session.step.failed":
-        case "session.execution.failed": {
-          if (!options.replay.enabled || !record.data.error) return
-          if (!shouldRetry(record.data.error, classifierOptions)) return
-          void scheduleReplay(record.data.sessionID, record.data.error).catch(() => {})
-          break
-        }
-        case "session.execution.interrupted": {
-          state.cancelTimer(record.data.sessionID)
-          state.get(record.data.sessionID).interrupted = true
-          break
-        }
-      }
-    }
+    // -------------------------------------------------------------------------
+    // Failure signal: a turn failed after its own backoff retries.
+    // -------------------------------------------------------------------------
 
     const controller = new AbortController()
     void (async () => {
       try {
         for await (const event of ctx.event.subscribe({ signal: controller.signal })) {
-          handleEvent(event)
+          const record = event as {
+            type?: string
+            data?: { sessionID?: string; error?: ProviderError }
+          }
+          if (!record?.type || !record.data?.sessionID) continue
+
+          if (record.type === "session.step.failed" || record.type === "session.execution.failed") {
+            const error = record.data.error
+            if (error && shouldRetry(error)) onTurnFailed(record.data.sessionID, error)
+          } else if (record.type === "session.execution.interrupted") {
+            states.cancelTimer(record.data.sessionID)
+            states.get(record.data.sessionID).interrupted = true
+          }
         }
       } catch {
-        // Stream closed during shutdown; ignore.
+        // Stream closed during shutdown.
       }
     })()
 
     return () => {
       controller.abort()
-      for (const session of state.allSessions()) {
-        if (session.timer) clearTimeout(session.timer)
+      for (const state of states.all()) {
+        if (state.timer) clearTimeout(state.timer)
       }
     }
   },
